@@ -1,12 +1,20 @@
-"""Tests for zotero_arxiv_daily.executor: normalize_path_patterns, filter_corpus, fetch_zotero_corpus, E2E."""
+"""Tests for zotero_arxiv_daily.executor: normalize_path_patterns, filter_corpus, incremental-sync E2E."""
 
+import hashlib
+import smtplib
 from datetime import datetime
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
+from pyzotero.errors import UserNotAuthorisedError
 
 from zotero_arxiv_daily.executor import Executor, normalize_path_patterns
 from zotero_arxiv_daily.protocol import CorpusPaper
+from zotero_arxiv_daily.sync.zotero_client import SyncPermissionError
+
+_ZOTERO_PATCH_TARGET = "zotero_arxiv_daily.sync.zotero_client.zotero.Zotero"
 
 
 # ---------------------------------------------------------------------------
@@ -100,88 +108,11 @@ def test_filter_corpus_no_filters_returns_all():
 
 
 # ---------------------------------------------------------------------------
-# fetch_zotero_corpus
+# E2E: Executor.run() over the incremental sync layer
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_zotero_corpus(config, monkeypatch):
-    from tests.canned_responses import make_stub_zotero_client
-
-    stub_zot = make_stub_zotero_client()
-    monkeypatch.setattr("zotero_arxiv_daily.executor.zotero.Zotero", lambda *a, **kw: stub_zot)
-
-    executor = Executor.__new__(Executor)
-    executor.config = config
-    corpus = executor.fetch_zotero_corpus()
-
-    assert len(corpus) == 2
-    assert corpus[0].title == "Stub Paper 1"
-    assert "survey/topic-a" in corpus[0].paths[0]
-
-
-def test_fetch_zotero_corpus_paper_with_zero_collections(config, monkeypatch):
-    from tests.canned_responses import make_stub_zotero_client
-
-    items = [
-        {
-            "data": {
-                "title": "No Collection Paper",
-                "abstractNote": "Abstract.",
-                "dateAdded": "2026-03-01T00:00:00Z",
-                "collections": [],
-            }
-        }
-    ]
-    stub_zot = make_stub_zotero_client(items=items)
-    monkeypatch.setattr("zotero_arxiv_daily.executor.zotero.Zotero", lambda *a, **kw: stub_zot)
-
-    executor = Executor.__new__(Executor)
-    executor.config = config
-    corpus = executor.fetch_zotero_corpus()
-
-    assert len(corpus) == 1
-    assert corpus[0].paths == []
-
-
-# ---------------------------------------------------------------------------
-# E2E: Executor.run()
-# ---------------------------------------------------------------------------
-
-
-def test_run_end_to_end(config, monkeypatch):
-    """Full pipeline: Zotero fetch -> filter -> retrieve -> rerank -> TLDR -> email."""
-    import smtplib
-
-    from omegaconf import open_dict
-
-    from tests.canned_responses import (
-        make_sample_corpus,
-        make_sample_paper,
-        make_stub_openai_client,
-        make_stub_smtp,
-        make_stub_zotero_client,
-    )
-
-    # Config: source=["arxiv"], reranker="api", send_empty=false
-    with open_dict(config):
-        config.executor.source = ["arxiv"]
-        config.executor.reranker = "api"
-        config.executor.send_empty = False
-
-    # 1. Stub pyzotero
-    stub_zot = make_stub_zotero_client()
-    monkeypatch.setattr("zotero_arxiv_daily.executor.zotero.Zotero", lambda *a, **kw: stub_zot)
-
-    # 2. Stub OpenAI (for reranker + TLDR/affiliations)
-    stub_client = make_stub_openai_client()
-    monkeypatch.setattr("zotero_arxiv_daily.executor.OpenAI", lambda **kw: stub_client)
-    monkeypatch.setattr("zotero_arxiv_daily.reranker.api.OpenAI", lambda **kw: stub_client)
-    retrieved = [
-        make_sample_paper(title="E2E Paper 1", score=None),
-        make_sample_paper(title="E2E Paper 2", score=None),
-    ]
-
-    # Import to register the arxiv retriever
+def _stub_arxiv(monkeypatch, retrieved):
     import zotero_arxiv_daily.retriever.arxiv_retriever  # noqa: F401
 
     from zotero_arxiv_daily.retriever.base import registered_retrievers
@@ -191,22 +122,178 @@ def test_run_end_to_end(config, monkeypatch):
         "retrieve_papers",
         lambda self: retrieved,
     )
-
-    # 4. Stub SMTP
-    sent = []
-    monkeypatch.setattr(smtplib, "SMTP", make_stub_smtp(sent))
-
-    # 5. Stub sleep (reranker/retriever)
     monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
 
-    # 6. Run
+
+def _recording_openai_client(monkeypatch):
+    """Canned OpenAI whose embedding inputs are recorded."""
+    from tests.canned_responses import make_stub_openai_client
+
+    stub_client = make_stub_openai_client()
+    recorded: list[str] = []
+    original_create = stub_client.embeddings.create
+
+    def create(**kwargs):
+        recorded.extend(kwargs.get("input", []))
+        return original_create(**kwargs)
+
+    stub_client.embeddings.create = create
+    monkeypatch.setattr("zotero_arxiv_daily.executor.OpenAI", lambda **kw: stub_client)
+    monkeypatch.setattr("zotero_arxiv_daily.reranker.api.OpenAI", lambda **kw: stub_client)
+    return stub_client, recorded
+
+
+def test_run_two_rounds_reuses_corpus_embeddings(config, monkeypatch):
+    """TR-5.1: round 1 builds the cache; round 2 embeds candidates only."""
+    from tests.canned_responses import (
+        make_sample_paper,
+        make_stub_zotero_client,
+    )
+
+    with open_dict(config):
+        config.executor.source = ["arxiv"]
+        config.executor.reranker = "api"
+        config.executor.send_empty = False
+
+    stub_zot = make_stub_zotero_client()
+    monkeypatch.setattr(_ZOTERO_PATCH_TARGET, lambda *a, **kw: stub_zot)
+
+    _stub_arxiv(
+        monkeypatch,
+        [make_sample_paper(title="E2E Paper 1"),
+         make_sample_paper(title="E2E Paper 2")],
+    )
+    sent: list = []
+    monkeypatch.setattr(smtplib.SMTP, "__init__", lambda self, *a, **kw: None)
+    monkeypatch.setattr(smtplib.SMTP, "sendmail",
+                        lambda self, *a: sent.append(a))
+    monkeypatch.setattr(smtplib.SMTP, "starttls", lambda self: None)
+    monkeypatch.setattr(smtplib.SMTP, "login", lambda self, *a: None)
+    monkeypatch.setattr(smtplib.SMTP, "quit", lambda self: None)
+
+    # ---- round 1: full build ----
+    _, recorded_1 = _recording_openai_client(monkeypatch)
+    Executor(config).run()
+
+    assert any("Stub Paper 1" in t for t in recorded_1)
+    assert any("Stub Paper 2" in t for t in recorded_1)
+    assert any("E2E Paper 1" in t for t in recorded_1)
+
+    # ---- round 2: incremental, corpus cache hit ----
+    _, recorded_2 = _recording_openai_client(monkeypatch)
+    Executor(config).run()
+
+    assert not any("Stub Paper" in t for t in recorded_2), (
+        "corpus texts must not be re-embedded on the second run"
+    )
+    assert any("E2E Paper 1" in t for t in recorded_2)
+    assert any("E2E Paper 2" in t for t in recorded_2)
+
+    assert len(sent) == 2
+    for _, _, email_body in sent:
+        assert "text/html" in email_body
+
+
+def test_filtered_corpus_vectors_align_by_key(config, monkeypatch):
+    """TR-5.2: after glob filtering, matrix rows follow paper keys/order."""
+    from tests.canned_responses import (
+        make_sample_paper,
+        make_stub_zotero_client,
+    )
+
+    with open_dict(config):
+        config.executor.source = ["arxiv"]
+        config.executor.reranker = "api"
+        config.executor.send_empty = False
+        # "survey" (ITEM2's path) is excluded; "survey/topic-a" (ITEM1) stays
+        config.zotero.ignore_path = ["survey"]
+
+    stub_zot = make_stub_zotero_client()
+    monkeypatch.setattr(_ZOTERO_PATCH_TARGET, lambda *a, **kw: stub_zot)
+    _stub_arxiv(monkeypatch, [make_sample_paper(title="Candidate X")])
+
+    # Deterministic, text-distinct embeddings so row alignment is checkable.
+    from tests.canned_responses import make_stub_openai_client
+
+    stub_client = make_stub_openai_client()
+
+    def create(**kwargs):
+        data = []
+        for i, text in enumerate(kwargs.get("input", [])):
+            seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:8], 16)
+            vec = np.random.RandomState(seed).rand(3).astype(np.float32).tolist()
+            data.append(SimpleNamespace(embedding=vec, index=i, object="embedding"))
+        return SimpleNamespace(data=data, model="m", object="list")
+
+    stub_client.embeddings.create = create
+    monkeypatch.setattr("zotero_arxiv_daily.executor.OpenAI", lambda **kw: stub_client)
+    monkeypatch.setattr("zotero_arxiv_daily.reranker.api.OpenAI", lambda **kw: stub_client)
+    sent: list = []
+    monkeypatch.setattr(smtplib.SMTP, "__init__", lambda self, *a, **kw: None)
+    monkeypatch.setattr(smtplib.SMTP, "sendmail",
+                        lambda self, *a: sent.append(a))
+    monkeypatch.setattr(smtplib.SMTP, "starttls", lambda self: None)
+    monkeypatch.setattr(smtplib.SMTP, "login", lambda self, *a: None)
+    monkeypatch.setattr(smtplib.SMTP, "quit", lambda self: None)
+
     executor = Executor(config)
+    captured = {}
+
+    def spy(candidates, corpus, corpus_embeddings=None):
+        captured["corpus"] = corpus
+        captured["matrix"] = corpus_embeddings
+        return executor.reranker.__class__.rerank(
+            executor.reranker, candidates, corpus, corpus_embeddings
+        )
+
+    executor.reranker.rerank = spy
     executor.run()
 
-    # Assertions
-    assert len(sent) == 1, "Email should have been sent"
-    _, _, email_body = sent[0]
-    assert "text/html" in email_body
+    rerank_corpus = captured["corpus"]
+    matrix = captured["matrix"]
+    assert [p.key for p in rerank_corpus] == ["ITEM1"]
+    assert matrix.shape == (1, 3)
+
+    full_papers, full_matrix = executor.syncer.load_corpus()
+    full_index = {p.key: i for i, p in enumerate(full_papers)}
+    np.testing.assert_allclose(
+        matrix[0], full_matrix[full_index["ITEM1"]]
+    )
+    assert len(sent) == 1
+
+
+def test_sync_permission_error_aborts_without_email(config, monkeypatch):
+    """TR-5.3: permission failure propagates; no email is sent."""
+    from tests.canned_responses import (
+        make_sample_paper,
+        make_stub_openai_client,
+        make_stub_zotero_client,
+    )
+
+    with open_dict(config):
+        config.executor.source = ["arxiv"]
+        config.executor.reranker = "api"
+
+    stub_zot = make_stub_zotero_client(
+        key_info=UserNotAuthorisedError("403 revoked mid-run")
+    )
+    monkeypatch.setattr(_ZOTERO_PATCH_TARGET, lambda *a, **kw: stub_zot)
+    _stub_arxiv(monkeypatch, [make_sample_paper(title="Never Reached")])
+
+    stub_client = make_stub_openai_client()
+    monkeypatch.setattr("zotero_arxiv_daily.executor.OpenAI", lambda **kw: stub_client)
+    monkeypatch.setattr("zotero_arxiv_daily.reranker.api.OpenAI", lambda **kw: stub_client)
+    sent: list = []
+    monkeypatch.setattr(smtplib.SMTP, "__init__", lambda self, *a, **kw: None)
+    monkeypatch.setattr(smtplib.SMTP, "sendmail",
+                        lambda self, *a: sent.append(a))
+    monkeypatch.setattr(smtplib.SMTP, "starttls", lambda self: None)
+    monkeypatch.setattr(smtplib.SMTP, "login", lambda self, *a: None)
+    monkeypatch.setattr(smtplib.SMTP, "quit", lambda self: None)
+
+    with pytest.raises(SyncPermissionError):
+        Executor(config).run()
+    assert sent == []
 
 
 def test_run_no_papers_send_empty_false(config, monkeypatch):
@@ -223,7 +310,7 @@ def test_run_no_papers_send_empty_false(config, monkeypatch):
         config.executor.send_empty = False
 
     stub_zot = make_stub_zotero_client()
-    monkeypatch.setattr("zotero_arxiv_daily.executor.zotero.Zotero", lambda *a, **kw: stub_zot)
+    monkeypatch.setattr(_ZOTERO_PATCH_TARGET, lambda *a, **kw: stub_zot)
 
     stub_client = make_stub_openai_client()
     monkeypatch.setattr("zotero_arxiv_daily.executor.OpenAI", lambda **kw: stub_client)
@@ -259,7 +346,7 @@ def test_run_no_papers_send_empty_true(config, monkeypatch):
         config.executor.send_empty = True
 
     stub_zot = make_stub_zotero_client()
-    monkeypatch.setattr("zotero_arxiv_daily.executor.zotero.Zotero", lambda *a, **kw: stub_zot)
+    monkeypatch.setattr(_ZOTERO_PATCH_TARGET, lambda *a, **kw: stub_zot)
 
     stub_client = make_stub_openai_client()
     monkeypatch.setattr("zotero_arxiv_daily.executor.OpenAI", lambda **kw: stub_client)

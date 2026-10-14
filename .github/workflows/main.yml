@@ -7,6 +7,9 @@ on:
 jobs:
   calculate-and-send:
     runs-on: ubuntu-latest
+    env:
+      # Persistent home for the incremental sync watermark and embedding cache.
+      ZOTERO_STATE_DIR: ${{ github.workspace }}/.zotero_sync
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -16,6 +19,20 @@ jobs:
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
+
+      - name: Restore Zotero sync state
+        uses: actions/cache@v4
+        with:
+          path: .zotero_sync
+          # An exact (static) key would hit every day and actions/cache never
+          # re-saves on an exact hit, freezing the watermark at day one. The
+          # per-run key component forces a miss (=> fresh snapshot saved);
+          # restore-keys pull the newest prior snapshot for this account/OS.
+          key: "zotero-sync-${{ runner.os }}-${{ secrets.ZOTERO_ID }}-${{ github.run_id }}"
+          restore-keys:
+            - "zotero-sync-${{ runner.os }}-${{ secrets.ZOTERO_ID }}-"
+            - "zotero-sync-${{ runner.os }}-"
+        # The action's post-step saves the cache even when the run script fails.
 
       - name: Run script
         env:

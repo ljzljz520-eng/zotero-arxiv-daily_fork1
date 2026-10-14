@@ -1,12 +1,11 @@
 from loguru import logger
-from pyzotero import zotero
 from omegaconf import DictConfig, ListConfig
 from .utils import glob_match
 from .retriever import get_retriever_cls
 from .protocol import CorpusPaper
 import random
-from datetime import datetime
 from .reranker import get_reranker_cls
+from .sync.syncer import CorpusSyncer
 from .construct_email import render_email
 from .utils import send_email
 from openai import OpenAI
@@ -38,30 +37,30 @@ class Executor:
             source: get_retriever_cls(source)(config) for source in config.executor.source
         }
         self.reranker = get_reranker_cls(config.executor.reranker)(config)
+        self.syncer = CorpusSyncer(config, embedding_provider=self.reranker)
         self.openai_client = OpenAI(api_key=config.llm.api.key, base_url=config.llm.api.base_url)
-    def fetch_zotero_corpus(self) -> list[CorpusPaper]:
-        logger.info("Fetching zotero corpus")
-        zot = zotero.Zotero(self.config.zotero.user_id, 'user', self.config.zotero.api_key)
-        collections = zot.everything(zot.collections())
-        collections = {c['key']:c for c in collections}
-        corpus = zot.everything(zot.items(itemType='conferencePaper || journalArticle || preprint'))
-        corpus = [c for c in corpus if c['data']['abstractNote'] != '']
-        def get_collection_path(col_key:str) -> str:
-            if p := collections[col_key]['data']['parentCollection']:
-                return get_collection_path(p) + '/' + collections[col_key]['data']['name']
-            else:
-                return collections[col_key]['data']['name']
-        for c in corpus:
-            paths = [get_collection_path(col) for col in c['data']['collections']]
-            c['paths'] = paths
-        logger.info(f"Fetched {len(corpus)} zotero papers")
-        return [CorpusPaper(
-            title=c['data']['title'],
-            abstract=c['data']['abstractNote'],
-            added_date=datetime.strptime(c['data']['dateAdded'], '%Y-%m-%dT%H:%M:%SZ'),
-            paths=c['paths']
-        ) for c in corpus]
-    
+
+    def _synced_corpus(self) -> tuple[list[CorpusPaper], "object"]:
+        """Incremental sync, then load papers + strictly aligned vectors."""
+        logger.info("Syncing zotero corpus")
+        self.syncer.sync()
+        corpus, corpus_embeddings = self.syncer.load_corpus()
+        logger.info(f"Synced {len(corpus)} zotero papers")
+        return corpus, corpus_embeddings
+
+    @staticmethod
+    def _align_embeddings(
+        corpus: list[CorpusPaper],
+        filtered: list[CorpusPaper],
+        corpus_embeddings,
+    ):
+        """Reorder the cached vector matrix to match the filtered paper list."""
+        index = {paper.key: i for i, paper in enumerate(corpus)}
+        rows = [index[paper.key] for paper in filtered]
+        if not rows:
+            return corpus_embeddings
+        return corpus_embeddings[rows]
+
     def filter_corpus(self, corpus:list[CorpusPaper]) -> list[CorpusPaper]:
         if self.include_path_patterns:
             logger.info(f"Selecting zotero papers matching include_path: {self.include_path_patterns}")
@@ -91,8 +90,11 @@ class Executor:
 
     
     def run(self):
-        corpus = self.fetch_zotero_corpus()
-        corpus = self.filter_corpus(corpus)
+        all_corpus, all_embeddings = self._synced_corpus()
+        corpus = self.filter_corpus(all_corpus)
+        corpus_embeddings = self._align_embeddings(
+            all_corpus, corpus, all_embeddings
+        )
         if len(corpus) == 0:
             logger.error(f"No zotero papers found. Please check your zotero settings:\n{self.config.zotero}")
             return
@@ -109,7 +111,9 @@ class Executor:
         reranked_papers = []
         if len(all_papers) > 0:
             logger.info("Reranking papers...")
-            reranked_papers = self.reranker.rerank(all_papers, corpus)
+            reranked_papers = self.reranker.rerank(
+                all_papers, corpus, corpus_embeddings=corpus_embeddings
+            )
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
             logger.info("Generating TLDR and affiliations...")
             for p in tqdm(reranked_papers):

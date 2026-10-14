@@ -137,3 +137,4 @@ class CorpusPaper:
     abstract: str
     added_date: datetime
     paths: list[str]
+    key: str = ""  # Zotero item key; used to align cached embedding vectors

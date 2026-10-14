@@ -17,3 +17,6 @@ models
 test-compose.yml
 outputs
 config/private.yaml
+
+# Zotero incremental sync state (watermark + embedding cache)
+.zotero_sync/

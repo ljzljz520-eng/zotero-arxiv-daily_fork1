@@ -4,11 +4,12 @@ All mocking uses pytest monkeypatch + SimpleNamespace. No unittest.mock.
 """
 
 import copy
+from pathlib import Path
 
 import pytest
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
-from pathlib import Path
+from omegaconf import open_dict
 
 _CONFIG_DIR = str(Path(__file__).resolve().parent.parent / "config")
 
@@ -50,9 +51,14 @@ def _base_config():
 
 
 @pytest.fixture()
-def config(_base_config):
+def config(_base_config, tmp_path):
     """Function-scoped deep copy of the session config.
 
-    Safe to mutate inside any test without polluting other tests.
+    Safe to mutate inside any test without polluting other tests. The Zotero
+    sync state directory is redirected under the per-test tmp path so runs
+    never touch (or share) a real ``.zotero_sync`` directory.
     """
-    return copy.deepcopy(_base_config)
+    cfg = copy.deepcopy(_base_config)
+    with open_dict(cfg):
+        cfg.zotero.state_dir = str(tmp_path / ".zotero_sync")
+    return cfg

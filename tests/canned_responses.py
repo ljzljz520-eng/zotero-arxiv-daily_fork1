@@ -77,57 +77,132 @@ def make_stub_openai_client():
 _DEFAULT_COLLECTIONS = [
     {
         "key": "COL1",
+        "version": 1,
         "data": {"name": "survey", "parentCollection": False},
     },
     {
         "key": "COL2",
+        "version": 1,
         "data": {"name": "topic-a", "parentCollection": "COL1"},
     },
 ]
 
 _DEFAULT_ITEMS = [
     {
+        "key": "ITEM1",
+        "version": 1,
         "data": {
             "title": "Stub Paper 1",
             "abstractNote": "Abstract of stub paper 1.",
             "dateAdded": "2026-01-15T10:00:00Z",
             "collections": ["COL2"],
+            "itemType": "journalArticle",
         },
     },
     {
+        "key": "ITEM2",
+        "version": 1,
         "data": {
             "title": "Stub Paper 2",
             "abstractNote": "Abstract of stub paper 2.",
             "dateAdded": "2026-02-20T12:00:00Z",
             "collections": ["COL1"],
+            "itemType": "journalArticle",
         },
     },
 ]
 
+_EMPTY_DELETED = {"items": [], "collections": [], "searches": [], "tags": []}
 
-def make_stub_zotero_client(collections=None, items=None):
+
+def _with_envelope(rows, prefix, *, kind):
+    """Fill key/version/itemType on bare payloads for callers that omit them."""
+    out = []
+    for i, row in enumerate(rows):
+        row = {**row}
+        row.setdefault("key", f"{prefix}{i + 1}")
+        row.setdefault("version", 1)
+        data = dict(row.get("data") or {})
+        if kind == "item":
+            data.setdefault("itemType", "journalArticle")
+        row["data"] = data
+        out.append(row)
+    return out
+
+
+def make_stub_zotero_client(
+    collections=None,
+    items=None,
+    *,
+    user_id=0,
+    library_version=5,
+    key_info=None,
+    deleted=None,
+):
     """Return a SimpleNamespace that quacks like pyzotero.zotero.Zotero.
 
-    Supports the call patterns used by Executor.fetch_zotero_corpus():
-        zot.everything(zot.collections())
-        zot.everything(zot.items(itemType=...))
+    Supports the incremental sync endpoints: key_info, item/collection
+    version snapshots (with a Last-Modified-Version response header),
+    since= item/collection pages, deleted tombstones and trash. This is a
+    single-snapshot stub: tests simulating multiple rounds script the rows
+    explicitly per round.
     """
-    cols = collections if collections is not None else _DEFAULT_COLLECTIONS
-    itms = items if items is not None else _DEFAULT_ITEMS
+    import copy
 
-    def everything(generator):
-        return generator
+    cols = _with_envelope(
+        copy.deepcopy(collections if collections is not None else _DEFAULT_COLLECTIONS),
+        "COL", kind="collection",
+    )
+    itms = _with_envelope(
+        copy.deepcopy(items if items is not None else _DEFAULT_ITEMS),
+        "ITEM", kind="item",
+    )
 
-    def collections_fn():
-        return cols
+    def key_info_fn(**kwargs):
+        if key_info is not None:
+            if isinstance(key_info, Exception):
+                raise key_info
+            return key_info
+        return {
+            "userID": user_id,
+            "username": "stub-user",
+            "access": {"user": {"library": True}},
+        }
+
+    def item_versions_fn(**kwargs):
+        return {row["key"]: row["version"] for row in itms}
+
+    def collection_versions_fn(**kwargs):
+        return {row["key"]: row["version"] for row in cols}
 
     def items_fn(**kwargs):
+        if "itemKey" in kwargs:  # reconcile fallback fetch
+            wanted = set(kwargs["itemKey"].split(","))
+            return [row for row in itms if row["key"] in wanted]
         return itms
 
+    def collections_fn(**kwargs):
+        return cols
+
+    def deleted_fn(**kwargs):
+        return deleted if deleted is not None else dict(_EMPTY_DELETED)
+
+    def trash_fn(**kwargs):
+        return []
+
     return SimpleNamespace(
-        everything=everything,
-        collections=collections_fn,
+        key_info=key_info_fn,
+        item_versions=item_versions_fn,
+        collection_versions=collection_versions_fn,
         items=items_fn,
+        collections=collections_fn,
+        deleted=deleted_fn,
+        trash=trash_fn,
+        follow=lambda: (_ for _ in ()).throw(AssertionError("no paged rows")),
+        links={},
+        request=SimpleNamespace(
+            headers={"last-modified-version": str(library_version)}
+        ),
     )
 
 
